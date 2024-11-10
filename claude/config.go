@@ -51,6 +51,9 @@ type Config struct {
 	LogOutput       string `json:"log_output" env:"CLAUDE_LOG_OUTPUT"`
 	EnableDebugLogs bool   `json:"enable_debug_logs" env:"CLAUDE_ENABLE_DEBUG_LOGS"`
 
+	// Beta Configuration
+	BetaFeatures []string `json:"beta_features" env:"CLAUDE_BETA_FEATURES"`
+
 	// Sources tracks where each config value came from
 	sources map[string]ConfigSource `json:"-"`
 }

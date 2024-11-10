@@ -51,7 +51,7 @@ func (c *Client) SendMessage(ctx context.Context, message string, opts *ClientOp
 		},
 	}
 
-	resp, err := c.Messages.Create(ctx, req)
+	resp, err := c.Messages.Create(ctx, req, opts)
 	if err != nil {
 		return "", fmt.Errorf("failed to send message: %w", err)
 	}

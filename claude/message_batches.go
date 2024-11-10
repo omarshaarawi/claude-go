@@ -97,8 +97,6 @@ func (s *MessageBatchesService) Create(ctx context.Context, req *CreateBatchRequ
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
-	httpReq.Header.Set("anthropic-beta", "message-batches-2024-09-24")
-
 	var batch MessageBatch
 	if err := s.client.do(httpReq, &batch); err != nil {
 		return nil, err
@@ -118,8 +116,6 @@ func (s *MessageBatchesService) Get(ctx context.Context, batchID string) (*Messa
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
-
-	httpReq.Header.Set("anthropic-beta", "message-batches-2024-09-24")
 
 	var batch MessageBatch
 	if err := s.client.do(httpReq, &batch); err != nil {
@@ -155,8 +151,6 @@ func (s *MessageBatchesService) List(ctx context.Context, opts *ListBatchesOptio
 	}
 	httpReq.URL.RawQuery = q.Encode()
 
-	httpReq.Header.Set("anthropic-beta", "message-batches-2024-09-24")
-
 	var response ListBatchesResponse
 	if err := s.client.do(httpReq, &response); err != nil {
 		return nil, err
@@ -177,8 +171,6 @@ func (s *MessageBatchesService) Cancel(ctx context.Context, batchID string) (*Me
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
-	httpReq.Header.Set("anthropic-beta", "message-batches-2024-09-24")
-
 	var batch MessageBatch
 	if err := s.client.do(httpReq, &batch); err != nil {
 		return nil, err
@@ -198,8 +190,6 @@ func (s *MessageBatchesService) GetResults(ctx context.Context, batchID string) 
 	if err != nil {
 		return nil, nil, fmt.Errorf("error creating request: %w", err)
 	}
-
-	httpReq.Header.Set("anthropic-beta", "message-batches-2024-09-24")
 
 	resp, err := s.client.httpClient.Do(httpReq)
 	if err != nil {
@@ -281,4 +271,76 @@ func validateCreateBatchRequest(req *CreateBatchRequest) error {
 	}
 
 	return nil
+}
+
+type BatchPoller struct {
+	client       *Client
+	pollInterval time.Duration
+	timeout      time.Duration
+	progressFunc func(RequestCounts)
+}
+
+func NewBatchPoller(client *Client, opts ...BatchPollerOption) *BatchPoller {
+	poller := &BatchPoller{
+		client:       client,
+		pollInterval: 5 * time.Second,
+		timeout:      10 * time.Minute,
+		progressFunc: func(RequestCounts) {},
+	}
+
+	for _, opt := range opts {
+		opt(poller)
+	}
+
+	return poller
+}
+
+type BatchPollerOption func(*BatchPoller)
+
+func WithPollInterval(d time.Duration) BatchPollerOption {
+	return func(p *BatchPoller) {
+		p.pollInterval = d
+	}
+}
+
+func WithTimeout(d time.Duration) BatchPollerOption {
+	return func(p *BatchPoller) {
+		p.timeout = d
+	}
+}
+
+func WithProgressCallback(f func(RequestCounts)) BatchPollerOption {
+	return func(p *BatchPoller) {
+		p.progressFunc = f
+	}
+}
+
+func (p *BatchPoller) WaitForCompletion(ctx context.Context, batchID string) error {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(p.pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			batch, err := p.client.MessageBatches.Get(ctx, batchID)
+			if err != nil {
+				return fmt.Errorf("error checking batch status: %w", err)
+			}
+
+			// Report progress
+			p.progressFunc(batch.RequestCounts)
+
+			switch batch.ProcessingStatus {
+			case "ended":
+				return nil
+			case "canceling":
+				return fmt.Errorf("batch was cancelled")
+			}
+		}
+	}
 }

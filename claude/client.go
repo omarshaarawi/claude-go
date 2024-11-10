@@ -26,6 +26,11 @@ const (
 	userAgent      = "claude-go"
 )
 
+const (
+	BetaPromptCaching  = "prompt-caching-2024-07-31"
+	BetaMessageBatches = "message-batches-2024-09-24"
+)
+
 // Client is the main struct for interacting with the Claude API
 type Client struct {
 	// HTTP client for making requests
@@ -109,6 +114,14 @@ func NewClientWithConfig(config *Config) (*Client, error) {
 		}
 	}
 
+	if c.headers == nil {
+		c.headers = make(map[string]string)
+	}
+
+	for _, v := range config.BetaFeatures {
+		c.headers["anthropic-beta"] = v
+	}
+
 	c.common.client = c
 	c.Messages = (*MessagesService)(&c.common)
 	c.MessageBatches = (*MessageBatchesService)(&c.common)
@@ -173,6 +186,31 @@ func WithBaseURL(baseURL string) ClientOption {
 			return fmt.Errorf("invalid base URL: %w", err)
 		}
 		c.baseURL = parsedURL
+		return nil
+	}
+}
+
+// Add type for beta features
+type BetaFeature string
+
+// Add helper to enable beta features
+func WithBeta(feature string) ClientOption {
+	return func(c *Client) error {
+		if c.headers == nil {
+			c.headers = make(map[string]string)
+		}
+		c.headers["anthropic-beta"] = feature
+		return nil
+	}
+}
+
+// Add helper to enable multiple beta features
+func WithBetas(features ...string) ClientOption {
+	return func(c *Client) error {
+		if c.headers == nil {
+			c.headers = make(map[string]string)
+		}
+		c.headers["anthropic-beta"] = strings.Join(features, ",")
 		return nil
 	}
 }
@@ -245,10 +283,15 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body inter
 
 // do performs the HTTP request and handles the response
 func (c *Client) do(req *http.Request, v interface{}) error {
+	if _, ok := c.headers["anthropic-beta"]; ok {
+		req.Header.Set("anthropic-beta", c.headers["anthropic-beta"])
+	}
+
 	c.logger.Debug("making request",
 		"method", req.Method,
 		"url", req.URL.String(),
 		"path", req.URL.Path,
+		"headers", req.Header,
 		"request_id", req.Context().Value("request_id"),
 	)
 
@@ -282,6 +325,15 @@ func (c *Client) do(req *http.Request, v interface{}) error {
 	}
 
 	if v != nil && len(body) > 0 {
+		if msg, ok := v.(*Message); ok {
+			var fullResp struct {
+				Usage *MessageUsage `json:"usage"`
+			}
+			if err := json.Unmarshal(body, &fullResp); err == nil && fullResp.Usage != nil {
+				msg.Usage = fullResp.Usage
+			}
+		}
+
 		if err := json.Unmarshal(body, v); err != nil {
 			c.logger.Error("failed to decode response",
 				"error", err,
@@ -292,28 +344,6 @@ func (c *Client) do(req *http.Request, v interface{}) error {
 	}
 
 	return nil
-}
-
-// Helper function to estimate tokens
-func estimateTokens(req *http.Request) (inputTokens, outputTokens int) {
-	var reqBody struct {
-		MaxTokens int `json:"max_tokens"`
-		Messages  []struct {
-			Content string `json:"content"`
-		} `json:"messages"`
-	}
-
-	if err := json.NewDecoder(req.Body).Decode(&reqBody); err == nil {
-		bodyBytes, _ := json.Marshal(reqBody)
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-		for _, msg := range reqBody.Messages {
-			inputTokens += len(msg.Content) / 4
-		}
-		outputTokens = reqBody.MaxTokens
-	}
-
-	return inputTokens, outputTokens
 }
 
 func (c *Client) Version() string {

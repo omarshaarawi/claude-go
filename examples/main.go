@@ -21,6 +21,7 @@ func main() {
 		RetryWaitMin:       1 * time.Second,
 		RetryWaitMax:       5 * time.Second,
 		Timeout:            30 * time.Second,
+		BetaFeatures:       []string{claude.BetaPromptCaching, claude.BetaMessageBatches},
 	}
 
 	if config.APIKey == "" {

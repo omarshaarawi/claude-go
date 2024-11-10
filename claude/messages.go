@@ -86,7 +86,7 @@ type MessageRequest struct {
 
 type MessageContent struct {
 	Role    MessageRole `json:"role"`
-	Content interface{} `json:"content"` // Can be string or []ContentBlock
+	Content interface{} `json:"content"`
 }
 
 // Tool represents a tool that can be used by Claude
@@ -133,7 +133,7 @@ type Delta struct {
 type MessagesService service
 
 // Create creates a new message
-func (s *MessagesService) Create(ctx context.Context, req *MessageRequest) (*Message, error) {
+func (s *MessagesService) Create(ctx context.Context, req *MessageRequest, opts *ClientOptions) (*Message, error) {
 	for i, msg := range req.Messages {
 		if content, ok := msg.Content.(string); ok {
 			req.Messages[i].Content = []ContentBlock{

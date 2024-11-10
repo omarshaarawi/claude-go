@@ -74,7 +74,7 @@ func (conv *Conversation) Send(ctx context.Context) (string, error) {
 		Messages:  conv.messages,
 	}
 
-	resp, err := conv.client.Messages.Create(ctx, req)
+	resp, err := conv.client.Messages.Create(ctx, req, &conv.options)
 	if err != nil {
 		return "", fmt.Errorf("failed to send conversation: %w", err)
 	}
