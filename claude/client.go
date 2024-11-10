@@ -29,6 +29,7 @@ const (
 const (
 	BetaPromptCaching  = "prompt-caching-2024-07-31"
 	BetaMessageBatches = "message-batches-2024-09-24"
+	BetaTokenCounting  = "token-counting-2024-11-01"
 )
 
 // Client is the main struct for interacting with the Claude API
