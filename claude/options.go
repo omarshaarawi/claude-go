@@ -138,36 +138,3 @@ func (c *Client) SendMessageStream(ctx context.Context, message string, opts *Cl
 
 	return textChan, streamErrChan, nil
 }
-
-// CountTokens is a convenience function to count the number of tokens in a message
-func (c *Client) CountTokens(ctx context.Context, message string, opts *ClientOptions) (int, error) {
-	options := defaultOptions()
-	if opts != nil {
-		if opts.Model != "" {
-			options.Model = opts.Model
-		}
-		options.System = opts.System
-	}
-
-	if err := models.ValidateModel(options.Model); err != nil {
-		return 0, err
-	}
-
-	req := &MessageRequest{
-		Model:  string(options.Model),
-		System: options.System,
-		Messages: []MessageContent{
-			{
-				Role:    MessageRoleUser,
-				Content: message,
-			},
-		},
-	}
-
-	resp, err := c.Messages.CountTokens(ctx, req)
-	if err != nil {
-		return 0, fmt.Errorf("failed to count tokens: %w", err)
-	}
-
-	return resp, nil
-}
