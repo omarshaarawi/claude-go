@@ -19,7 +19,12 @@ func (c *Client) NewConversation(opts *ClientOptions) *Conversation {
 	options := defaultOptions()
 	if opts != nil {
 		if opts.Model != "" {
+			model, ok := models.ModelConfigs[opts.Model]
+			if !ok {
+				return nil
+			}
 			options.Model = opts.Model
+			options.MaxTokens = model.DefaultTokens
 		}
 		if opts.MaxTokens > 0 {
 			options.MaxTokens = opts.MaxTokens

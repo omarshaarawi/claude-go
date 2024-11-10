@@ -27,7 +27,12 @@ func (c *Client) SendMessage(ctx context.Context, message string, opts *ClientOp
 	options := defaultOptions()
 	if opts != nil {
 		if opts.Model != "" {
+			model, ok := models.ModelConfigs[opts.Model]
+			if !ok {
+				return "", fmt.Errorf("invalid model: %s", opts.Model)
+			}
 			options.Model = opts.Model
+			options.MaxTokens = model.DefaultTokens
 		}
 		if opts.MaxTokens > 0 {
 			options.MaxTokens = opts.MaxTokens
@@ -68,7 +73,12 @@ func (c *Client) SendMessageStream(ctx context.Context, message string, opts *Cl
 	options := defaultOptions()
 	if opts != nil {
 		if opts.Model != "" {
+			model, ok := models.ModelConfigs[opts.Model]
+			if !ok {
+				return nil, nil, fmt.Errorf("invalid model: %s", opts.Model)
+			}
 			options.Model = opts.Model
+			options.MaxTokens = model.DefaultTokens
 		}
 		if opts.MaxTokens > 0 {
 			options.MaxTokens = opts.MaxTokens
