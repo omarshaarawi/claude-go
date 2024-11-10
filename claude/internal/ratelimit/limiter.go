@@ -3,20 +3,13 @@ package ratelimit
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 )
 
-// RateLimitConfig represents the rate limits for a model
-type RateLimitConfig struct {
-	RequestsPerMinute int
-	TokensPerMinute   int
-	TokensPerDay      int
-}
-
-// defaultRateLimits defines the default rate limits for each model
 var defaultRateLimits = map[string]RateLimitConfig{
 	// Claude 3.5 Family
 	"claude-3-5-sonnet-20241022": {
@@ -47,102 +40,147 @@ var defaultRateLimits = map[string]RateLimitConfig{
 	},
 }
 
-// TokenBucket implements a token bucket rate limiter
-type TokenBucket struct {
-	tokens   float64
-	capacity float64
-	rate     float64
-	lastTime time.Time
-	mu       sync.Mutex
+// RateLimitConfig represents the rate limits for a model
+type RateLimitConfig struct {
+	RequestsPerMinute int
+	TokensPerMinute   int
+	TokensPerDay      int
 }
 
-// NewTokenBucket creates a new token bucket rate limiter
+// TokenBucket implements a thread-safe token bucket algorithm
+type TokenBucket struct {
+	tokens         float64
+	capacity       float64
+	rate           float64
+	lastRefillTime time.Time
+	retryAfter     time.Time
+	mu             sync.Mutex
+}
+
+// NewTokenBucket creates a new token bucket with initial capacity and refill rate
 func NewTokenBucket(capacity int, refillPerSecond float64) *TokenBucket {
 	return &TokenBucket{
-		tokens:   float64(capacity),
-		capacity: float64(capacity),
-		rate:     refillPerSecond,
-		lastTime: time.Now(),
+		tokens:         float64(capacity),
+		capacity:       float64(capacity),
+		rate:           refillPerSecond,
+		lastRefillTime: time.Now(),
 	}
 }
 
-// Take attempts to take n tokens from the bucket
-func (tb *TokenBucket) Take(n int) bool {
+// Take attempts to take tokens from the bucket, returning wait time if not enough tokens
+func (tb *TokenBucket) Take(n int) (time.Duration, bool) {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
 	now := time.Now()
-	duration := now.Sub(tb.lastTime).Seconds()
-	tb.tokens = min(tb.capacity, tb.tokens+duration*tb.rate)
-	tb.lastTime = now
+
+	if !tb.retryAfter.IsZero() && now.Before(tb.retryAfter) {
+		return tb.retryAfter.Sub(now), false
+	}
+
+	elapsed := now.Sub(tb.lastRefillTime).Seconds()
+	tb.tokens = math.Min(tb.capacity, tb.tokens+elapsed*tb.rate)
+	tb.lastRefillTime = now
 
 	if float64(n) > tb.tokens {
-		return false
+		requiredTokens := float64(n) - tb.tokens
+		waitTime := time.Duration(requiredTokens / tb.rate * float64(time.Second))
+		return waitTime, false
 	}
 
 	tb.tokens -= float64(n)
-	return true
+	return 0, true
 }
 
-// SlidingWindowRateLimiter implements a sliding window rate limiter
-type SlidingWindowRateLimiter struct {
-	window   time.Duration
-	limit    int
-	requests []time.Time
-	mu       sync.Mutex
+// SetRetryAfter sets a retry-after time based on API response
+func (tb *TokenBucket) SetRetryAfter(d time.Duration) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.retryAfter = time.Now().Add(d)
 }
 
-// NewSlidingWindowRateLimiter creates a new sliding window rate limiter
-func NewSlidingWindowRateLimiter(window time.Duration, limit int) *SlidingWindowRateLimiter {
-	return &SlidingWindowRateLimiter{
-		window:   window,
-		limit:    limit,
-		requests: make([]time.Time, 0, limit),
-	}
-}
+// UpdateCapacity updates the bucket's capacity and current tokens
+func (tb *TokenBucket) UpdateCapacity(newCapacity int) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
 
-// Allow checks if a new request is allowed
-func (sw *SlidingWindowRateLimiter) Allow() bool {
-	sw.mu.Lock()
-	defer sw.mu.Unlock()
-
-	now := time.Now()
-	windowStart := now.Add(-sw.window)
-
-	// Remove old requests
-	i := 0
-	for ; i < len(sw.requests); i++ {
-		if sw.requests[i].After(windowStart) {
-			break
-		}
-	}
-	if i > 0 {
-		sw.requests = sw.requests[i:]
-	}
-
-	// Check if we're at the limit
-	if len(sw.requests) >= sw.limit {
-		return false
-	}
-
-	// Add new request
-	sw.requests = append(sw.requests, now)
-	return true
-}
-
-// RateLimiter handles rate limiting for the Claude API
-type RateLimiter struct {
-	modelLimiters map[string]*ModelRateLimiter
-	mu            sync.RWMutex
+	ratio := float64(newCapacity) / tb.capacity
+	tb.tokens = math.Min(float64(newCapacity), tb.tokens*ratio)
+	tb.capacity = float64(newCapacity)
 }
 
 // ModelRateLimiter handles rate limiting for a specific model
 type ModelRateLimiter struct {
 	config            RateLimitConfig
-	requestLimiter    *SlidingWindowRateLimiter
+	requestLimiter    *TokenBucket
 	tokenMinuteBucket *TokenBucket
 	tokenDayBucket    *TokenBucket
 	mu                sync.RWMutex
+}
+
+// NewModelRateLimiter creates a new model-specific rate limiter
+func NewModelRateLimiter(config RateLimitConfig) *ModelRateLimiter {
+	return &ModelRateLimiter{
+		config:            config,
+		requestLimiter:    NewTokenBucket(config.RequestsPerMinute, float64(config.RequestsPerMinute)/60.0),
+		tokenMinuteBucket: NewTokenBucket(config.TokensPerMinute, float64(config.TokensPerMinute)/60.0),
+		tokenDayBucket:    NewTokenBucket(config.TokensPerDay, float64(config.TokensPerDay)/(24*60*60)),
+	}
+}
+
+// checkCapacity checks if the request can be made within rate limits
+func (ml *ModelRateLimiter) checkCapacity(tokens int) (time.Duration, bool) {
+	ml.mu.RLock()
+	defer ml.mu.RUnlock()
+
+	if waitTime, ok := ml.requestLimiter.Take(1); !ok {
+		return waitTime, false
+	}
+
+	if waitTime, ok := ml.tokenMinuteBucket.Take(tokens); !ok {
+		return waitTime, false
+	}
+
+	if waitTime, ok := ml.tokenDayBucket.Take(tokens); !ok {
+		return waitTime, false
+	}
+
+	return 0, true
+}
+
+// UpdateFromHeaders updates rate limits based on API response headers
+func (ml *ModelRateLimiter) UpdateFromHeaders(headers http.Header) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+
+	if retryAfter := headers.Get("retry-after"); retryAfter != "" {
+		if seconds, err := strconv.Atoi(retryAfter); err == nil {
+			duration := time.Duration(seconds) * time.Second
+			ml.requestLimiter.SetRetryAfter(duration)
+			ml.tokenMinuteBucket.SetRetryAfter(duration)
+			ml.tokenDayBucket.SetRetryAfter(duration)
+		}
+	}
+
+	if limit := headers.Get("anthropic-ratelimit-requests-limit"); limit != "" {
+		if n, err := strconv.Atoi(limit); err == nil {
+			ml.config.RequestsPerMinute = n
+			ml.requestLimiter.UpdateCapacity(n)
+		}
+	}
+
+	if limit := headers.Get("anthropic-ratelimit-tokens-limit"); limit != "" {
+		if n, err := strconv.Atoi(limit); err == nil {
+			ml.config.TokensPerMinute = n
+			ml.tokenMinuteBucket.UpdateCapacity(n)
+		}
+	}
+}
+
+// RateLimiter handles rate limiting across all models
+type RateLimiter struct {
+	modelLimiters map[string]*ModelRateLimiter
+	mu            sync.RWMutex
 }
 
 // NewRateLimiter creates a new rate limiter
@@ -174,74 +212,89 @@ func (rl *RateLimiter) getModelLimiter(model string) (*ModelRateLimiter, error) 
 		return limiter, nil
 	}
 
-	limiter = &ModelRateLimiter{
-		config:            config,
-		requestLimiter:    NewSlidingWindowRateLimiter(time.Minute, config.RequestsPerMinute),
-		tokenMinuteBucket: NewTokenBucket(config.TokensPerMinute, float64(config.TokensPerMinute)/60),
-		tokenDayBucket:    NewTokenBucket(config.TokensPerDay, float64(config.TokensPerDay)/(24*60*60)),
-	}
-
+	limiter = NewModelRateLimiter(config)
 	rl.modelLimiters[model] = limiter
 	return limiter, nil
 }
 
 // WaitForCapacity waits until rate limits allow the request
-func (rl *RateLimiter) WaitForCapacity(ctx context.Context, model string, inputTokens, outputTokens int) error {
+func (rl *RateLimiter) WaitForCapacity(ctx context.Context, model string, totalTokens int) error {
 	limiter, err := rl.getModelLimiter(model)
 	if err != nil {
 		return err
 	}
 
-	totalTokens := inputTokens + outputTokens
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
+	attempt := 0
+	maxAttempts := 50
+
 	for {
+		waitTime, allowed := limiter.checkCapacity(totalTokens)
+		if allowed {
+			return nil
+		}
+
+		attempt++
+		if attempt >= maxAttempts {
+			return fmt.Errorf("rate limit exceeded: max wait time reached")
+		}
+
+		backoffDuration := time.Duration(math.Min(
+			float64(waitTime),
+			float64(100*time.Millisecond)*math.Pow(1.5, float64(attempt)),
+		))
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
-			if limiter.checkCapacity(totalTokens) {
-				return nil
-			}
+		case <-time.After(backoffDuration):
+			continue
 		}
 	}
 }
 
-// checkCapacity checks if the request can be made within rate limits
-func (ml *ModelRateLimiter) checkCapacity(totalTokens int) bool {
-	ml.mu.Lock()
-	defer ml.mu.Unlock()
-
-	return ml.requestLimiter.Allow() &&
-		ml.tokenMinuteBucket.Take(totalTokens) &&
-		ml.tokenDayBucket.Take(totalTokens)
-}
-
-// UpdateLimits updates the rate limits based on API response headers
+// UpdateLimits updates rate limits based on API response
 func (rl *RateLimiter) UpdateLimits(model string, headers http.Header) {
 	limiter, err := rl.getModelLimiter(model)
 	if err != nil {
 		return
 	}
 
-	limiter.mu.Lock()
-	defer limiter.mu.Unlock()
+	limiter.UpdateFromHeaders(headers)
+}
 
-	// Update request limits if provided
-	if limit := headers.Get("anthropic-ratelimit-requests-limit"); limit != "" {
-		if n, err := strconv.Atoi(limit); err == nil {
-			limiter.config.RequestsPerMinute = n
-		}
+// QueueRequest represents a rate-limited request
+type QueueRequest struct {
+	Model      string
+	TokenCount int
+	Context    context.Context
+	ResultChan chan<- error
+}
+
+// RequestQueue handles queuing and processing of rate-limited requests
+type RequestQueue struct {
+	requests    chan *QueueRequest
+	rateLimiter *RateLimiter
+	workerCount int
+	shutdown    chan struct{}
+}
+
+// NewRequestQueue creates a new request queue
+func NewRequestQueue(rateLimiter *RateLimiter, workerCount int) *RequestQueue {
+	q := &RequestQueue{
+		requests:    make(chan *QueueRequest, 1000),
+		rateLimiter: rateLimiter,
+		workerCount: workerCount,
+		shutdown:    make(chan struct{}),
 	}
 
-	// Update token limits if provided
-	if limit := headers.Get("anthropic-ratelimit-tokens-limit"); limit != "" {
-		if n, err := strconv.Atoi(limit); err == nil {
-			limiter.config.TokensPerMinute = n
-			limiter.tokenMinuteBucket = NewTokenBucket(n, float64(n)/60)
-		}
+	for i := 0; i < workerCount; i++ {
+		go q.worker()
 	}
+
+	return q
 }
 
 // SetModelLimits updates or sets the rate limits for a specific model
@@ -259,14 +312,7 @@ func (rl *RateLimiter) SetModelLimits(model string, config RateLimitConfig) erro
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	limiter := &ModelRateLimiter{
-		config:            config,
-		requestLimiter:    NewSlidingWindowRateLimiter(time.Minute, config.RequestsPerMinute),
-		tokenMinuteBucket: NewTokenBucket(config.TokensPerMinute, float64(config.TokensPerMinute)/60),
-		tokenDayBucket:    NewTokenBucket(config.TokensPerDay, float64(config.TokensPerDay)/(24*60*60)),
-	}
-
-	rl.modelLimiters[model] = limiter
+	rl.modelLimiters[model] = NewModelRateLimiter(config)
 	return nil
 }
 
@@ -280,41 +326,34 @@ func (rl *RateLimiter) GetModelLimits(model string) (*RateLimitConfig, error) {
 		return nil, fmt.Errorf("no rate limits found for model: %s", model)
 	}
 
-	// Return a copy of the config to prevent external modification
 	config := limiter.config
 	return &config, nil
 }
 
-// UpdateModelLimits updates the rate limits for a specific model
-func (rl *RateLimiter) UpdateModelLimits(model string, config RateLimitConfig) error {
-	// First remove existing limits if they exist
-	rl.mu.Lock()
-	if _, exists := rl.modelLimiters[model]; exists {
-		delete(rl.modelLimiters, model)
+// Submit adds a request to the queue
+func (q *RequestQueue) Submit(req *QueueRequest) error {
+	select {
+	case q.requests <- req:
+		return nil
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("queue full")
 	}
-	rl.mu.Unlock()
-
-	// Then set new limits
-	return rl.SetModelLimits(model, config)
 }
 
-// RemoveModelLimits removes rate limits for a specific model
-func (rl *RateLimiter) RemoveModelLimits(model string) {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	delete(rl.modelLimiters, model)
+// worker processes requests from the queue
+func (q *RequestQueue) worker() {
+	for {
+		select {
+		case <-q.shutdown:
+			return
+		case req := <-q.requests:
+			err := q.rateLimiter.WaitForCapacity(req.Context, req.Model, req.TokenCount)
+			req.ResultChan <- err
+		}
+	}
 }
 
-// ResetModelLimits resets all rate limiters for a specific model to their initial state
-func (rl *RateLimiter) ResetModelLimits(model string) error {
-	rl.mu.RLock()
-	config, ok := rl.modelLimiters[model]
-	rl.mu.RUnlock()
-
-	if !ok {
-		return fmt.Errorf("no rate limits found for model: %s", model)
-	}
-
-	return rl.SetModelLimits(model, config.config)
+// Shutdown stops all workers
+func (q *RequestQueue) Shutdown() {
+	close(q.shutdown)
 }

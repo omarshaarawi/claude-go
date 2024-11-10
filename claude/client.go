@@ -60,6 +60,9 @@ type Client struct {
 
 	// Rate limiter
 	rateLimiter *ratelimit.RateLimiter
+
+	// Rate limit request queue
+	requestQueue *ratelimit.RequestQueue
 }
 
 // service is a base service with a reference to the client
@@ -108,6 +111,8 @@ func NewClientWithConfig(config *Config) (*Client, error) {
 
 	if config.EnableRateLimiting {
 		c.rateLimiter = ratelimit.NewRateLimiter()
+		c.requestQueue = ratelimit.NewRequestQueue(c.rateLimiter, 5)
+
 		for model, limits := range config.CustomRateLimits {
 			if err := c.rateLimiter.SetModelLimits(model, limits); err != nil {
 				return nil, fmt.Errorf("error setting rate limits for model %s: %w", model, err)
@@ -159,6 +164,8 @@ func NewClient(apiKey string, opts ...ClientOption) (*Client, error) {
 
 	c.common.client = c
 	c.rateLimiter = ratelimit.NewRateLimiter()
+	c.requestQueue = ratelimit.NewRequestQueue(c.rateLimiter, 5)
+
 	c.Messages = (*MessagesService)(&c.common)
 	c.MessageBatches = (*MessageBatchesService)(&c.common)
 
@@ -238,6 +245,13 @@ func WithHeader(key, value string) ClientOption {
 	}
 }
 
+// Close cleans up any resources used by the client
+func (c *Client) Close() {
+	if c.requestQueue != nil {
+		c.requestQueue.Shutdown()
+	}
+}
+
 // newRequest creates a new HTTP request
 func (c *Client) newRequest(ctx context.Context, method, path string, body interface{}) (*http.Request, error) {
 	u := *c.baseURL
@@ -268,15 +282,17 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body inter
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
-	// Set headers
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", c.apiKey)
 	req.Header.Set("anthropic-version", apiVersion)
 	req.Header.Set("User-Agent", fmt.Sprintf("%s/%s (%s/%s)", userAgent, Version, runtime.GOOS, runtime.GOARCH))
 
-	// Set custom headers
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
+	}
+
+	if model, ok := ctx.Value("model").(string); ok {
+		req.Header.Set("x-model", model)
 	}
 
 	return req, nil
@@ -296,11 +312,56 @@ func (c *Client) do(req *http.Request, v interface{}) error {
 		"request_id", req.Context().Value("request_id"),
 	)
 
+	if c.rateLimiter != nil && c.requestQueue != nil {
+		model := req.Header.Get("x-model")
+		if model == "" {
+			if req.Body != nil {
+				bodyBytes, _ := io.ReadAll(req.Body)
+				req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+				var msgReq struct {
+					Model string `json:"model"`
+				}
+				if err := json.Unmarshal(bodyBytes, &msgReq); err == nil && msgReq.Model != "" {
+					model = msgReq.Model
+				}
+			}
+		}
+
+		if model != "" {
+			inputTokens := estimateTokenCount(req)
+
+			resultChan := make(chan error, 1)
+
+			queueReq := &ratelimit.QueueRequest{
+				Model:      model,
+				TokenCount: inputTokens,
+				Context:    req.Context(),
+				ResultChan: resultChan,
+			}
+
+			if err := c.requestQueue.Submit(queueReq); err != nil {
+				return fmt.Errorf("rate limit queue error: %w", err)
+			}
+
+			if err := <-resultChan; err != nil {
+				return fmt.Errorf("rate limit error: %w", err)
+			}
+		}
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if c.rateLimiter != nil {
+		model := req.Header.Get("x-model")
+		if model != "" {
+			c.rateLimiter.UpdateLimits(model, resp.Header)
+		}
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -316,7 +377,6 @@ func (c *Client) do(req *http.Request, v interface{}) error {
 	if resp.StatusCode >= 400 {
 		var apiErr APIError
 		if err := json.Unmarshal(body, &apiErr); err != nil {
-			// If we can't parse the error response, return the raw response
 			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
@@ -387,4 +447,20 @@ func setupLogger(config *Config) *slog.Logger {
 	}
 
 	return slog.New(logHandler)
+}
+
+// Add helper function to estimate token count
+func estimateTokenCount(req *http.Request) int {
+	if req.Body == nil {
+		return 100
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return 100
+	}
+
+	req.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	return len(body) / 4
 }

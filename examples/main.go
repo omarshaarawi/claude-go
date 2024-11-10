@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/omarshaarawi/claude-go/claude"
@@ -63,6 +64,11 @@ func main() {
 	// Example 4: Model Information
 	fmt.Println("\n=== Example 4: Model Information ===")
 	printModelInfo()
+
+	// Example 5: Rate Limiting
+	if err := rateLimitingExample(ctx, client); err != nil {
+		log.Printf("Error in rate limiting example: %v", err)
+	}
 }
 
 func simpleMessages(ctx context.Context, client *claude.Client) error {
@@ -152,6 +158,81 @@ func improvedStreamingMessage(ctx context.Context, client *claude.Client) error 
 			return ctx.Err()
 		}
 	}
+}
+
+func rateLimitingExample(ctx context.Context, client *claude.Client) error {
+	fmt.Println("\n=== Example 5: Rate Limiting ===")
+
+	// Create a slice of prompts to demonstrate concurrent requests
+	prompts := []string{
+		"What is 2+2?",
+		"What is the capital of France?",
+		"Who wrote Romeo and Juliet?",
+		"What is the speed of light?",
+		"What is photosynthesis?",
+		"Name three primary colors.",
+		"What is the largest planet?",
+		"Who painted the Mona Lisa?",
+		"What is the chemical formula for water?",
+		"What is the tallest mountain?",
+	}
+
+	// Create error group for concurrent requests
+	var wg sync.WaitGroup
+	results := make(map[int]string)
+	errors := make(map[int]error)
+	var mu sync.Mutex
+
+	// Process requests concurrently
+	fmt.Println("Sending multiple requests concurrently (rate limits will be applied)...")
+	for i, prompt := range prompts {
+		wg.Add(1)
+		go func(index int, question string) {
+			defer wg.Done()
+
+			// Create a context with the model information
+			ctxWithModel := context.WithValue(ctx, "model", string(claude.ModelClaude35Sonnet))
+
+			// Send the request
+			response, err := client.SendMessage(ctxWithModel, question, &claude.ClientOptions{
+				Model: claude.ModelClaude35Sonnet,
+			})
+
+			mu.Lock()
+			if err != nil {
+				if rateLimitErr, ok := claude.IsRateLimitError(err); ok {
+					errors[index] = fmt.Errorf("rate limit hit: retry after %d seconds (requests remaining: %d/%d, tokens remaining: %d/%d)",
+						rateLimitErr.RetryAfter,
+						rateLimitErr.RateLimitRequestsRemaining,
+						rateLimitErr.RateLimitRequestsLimit,
+						rateLimitErr.RateLimitTokensRemaining,
+						rateLimitErr.RateLimitTokensLimit,
+					)
+				} else {
+					errors[index] = err
+				}
+			} else {
+				results[index] = response
+			}
+			mu.Unlock()
+		}(i, prompt)
+	}
+
+	// Wait for all requests to complete
+	wg.Wait()
+
+	// Print results
+	fmt.Println("\nResults:")
+	for i := 0; i < len(prompts); i++ {
+		fmt.Printf("\nPrompt %d: %s\n", i+1, prompts[i])
+		if err, hasError := errors[i]; hasError {
+			fmt.Printf("Error: %v\n", err)
+		} else {
+			fmt.Printf("Response: %s\n", results[i])
+		}
+	}
+
+	return nil
 }
 
 func printModelInfo() {
