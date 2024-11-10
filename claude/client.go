@@ -314,6 +314,8 @@ func (c *Client) do(req *http.Request, v interface{}) error {
 
 	if c.rateLimiter != nil && c.requestQueue != nil {
 		model := req.Header.Get("x-model")
+		slog.Debug("Rate limiting check for model", slog.String("model", model))
+
 		if model == "" {
 			if req.Body != nil {
 				bodyBytes, _ := io.ReadAll(req.Body)
@@ -330,6 +332,7 @@ func (c *Client) do(req *http.Request, v interface{}) error {
 
 		if model != "" {
 			inputTokens := estimateTokenCount(req)
+			slog.Debug("Estimated tokens", slog.Int("tokens", inputTokens))
 
 			resultChan := make(chan error, 1)
 
@@ -344,11 +347,15 @@ func (c *Client) do(req *http.Request, v interface{}) error {
 				return fmt.Errorf("rate limit queue error: %w", err)
 			}
 
+			slog.Debug("Waiting for rate limit clearance")
 			if err := <-resultChan; err != nil {
 				return fmt.Errorf("rate limit error: %w", err)
 			}
+			slog.Debug("Rate limit cleared")
 		}
 	}
+
+	slog.Debug("Sending request", slog.String("url", req.URL.String()))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -449,18 +456,28 @@ func setupLogger(config *Config) *slog.Logger {
 	return slog.New(logHandler)
 }
 
-// Add helper function to estimate token count
+// Helper function to improve token estimation
 func estimateTokenCount(req *http.Request) int {
-	if req.Body == nil {
-		return 100
-	}
+    if req.Body == nil {
+        return 100 // Default minimum token count
+    }
 
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		return 100
-	}
+    bodyBytes, err := io.ReadAll(req.Body)
+    if err != nil {
+        return 100
+    }
 
-	req.Body = io.NopCloser(bytes.NewBuffer(body))
+    // Reset the body for future reads
+    req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	return len(body) / 4
+    // Improved estimation heuristic
+    textLength := len(bodyBytes)
+    if textLength == 0 {
+        return 100
+    }
+
+    // More accurate estimation based on typical token/byte ratio
+    // Average of ~4 bytes per token in typical text
+    return (textLength + 3) / 4
 }
+

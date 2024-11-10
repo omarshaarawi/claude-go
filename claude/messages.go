@@ -246,42 +246,52 @@ func (s *MessagesService) Stream(ctx context.Context, req *MessageRequest) (<-ch
 	return eventChan, errChan, nil
 }
 
-type inputTokensResponse struct {
+// TokenCount represents the response from the token counting endpoint
+type TokenCount struct {
 	InputTokens int `json:"input_tokens"`
 }
 
-// CountTokens counts the number of tokens in a message
-func (s *MessagesService) CountTokens(ctx context.Context, req *MessageRequest) (int, error) {
-	for i, msg := range req.Messages {
-		if content, ok := msg.Content.(string); ok {
-			req.Messages[i].Content = []ContentBlock{
-				{
-					Type: ContentBlockTypeText,
-					Text: content,
-				},
-			}
-		} else if content, ok := msg.Content.([]ContentBlock); ok {
-			req.Messages[i].Content = content
-		} else {
-			return 0, errors.NewValidationError("content", "must be either string or []ContentBlock")
-		}
-	}
+// TokenCountRequest represents a request to count tokens
+type TokenCountRequest struct {
+	Model    string           `json:"model"`
+	Messages []MessageContent `json:"messages"`
+	System   string           `json:"system,omitempty"`
+}
 
-	if err := validateMessageRequest(req); err != nil {
-		return 0, err
+// CountTokens counts the number of tokens in a message
+func (s *MessagesService) CountTokens(ctx context.Context, req *TokenCountRequest) (*TokenCount, error) {
+	if err := validateTokenCountRequest(req); err != nil {
+		return nil, err
 	}
 
 	httpReq, err := s.client.newRequest(ctx, http.MethodPost, "/messages/count_tokens", req)
 	if err != nil {
-		return 0, fmt.Errorf("error creating request: %w", err)
+		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
-	var response inputTokensResponse
-	if err := s.client.do(httpReq, &response); err != nil {
-		return 0, fmt.Errorf("error sending request: %w", err)
+	var count TokenCount
+	if err := s.client.do(httpReq, &count); err != nil {
+		return nil, fmt.Errorf("error counting tokens: %w", err)
 	}
 
-	return response.InputTokens, nil
+	return &count, nil
+}
+
+// validateTokenCountRequest validates a token count request
+func validateTokenCountRequest(req *TokenCountRequest) error {
+	if req == nil {
+		return errors.NewValidationError("request", "cannot be nil")
+	}
+
+	if req.Model == "" {
+		return errors.NewValidationError("model", "cannot be empty")
+	}
+
+	if len(req.Messages) == 0 {
+		return errors.NewValidationError("messages", "cannot be empty")
+	}
+
+	return nil
 }
 
 // validateMessageRequest validates a message request
