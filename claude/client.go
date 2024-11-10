@@ -314,6 +314,8 @@ func (c *Client) do(req *http.Request, v interface{}) error {
 
 	if c.rateLimiter != nil && c.requestQueue != nil {
 		model := req.Header.Get("x-model")
+		fmt.Printf("\nRate limiting check for model: %s\n", model)
+
 		if model == "" {
 			if req.Body != nil {
 				bodyBytes, _ := io.ReadAll(req.Body)
@@ -330,6 +332,7 @@ func (c *Client) do(req *http.Request, v interface{}) error {
 
 		if model != "" {
 			inputTokens := estimateTokenCount(req)
+			fmt.Printf("Estimated tokens: %d\n", inputTokens)
 
 			resultChan := make(chan error, 1)
 
@@ -344,11 +347,15 @@ func (c *Client) do(req *http.Request, v interface{}) error {
 				return fmt.Errorf("rate limit queue error: %w", err)
 			}
 
+			fmt.Println("Waiting for rate limit clearance...")
 			if err := <-resultChan; err != nil {
 				return fmt.Errorf("rate limit error: %w", err)
 			}
+			fmt.Println("✓ Rate limit cleared")
 		}
 	}
+
+	fmt.Printf("Sending request to %s...\n", req.URL.Path)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
