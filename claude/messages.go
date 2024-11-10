@@ -246,6 +246,40 @@ func (s *MessagesService) Stream(ctx context.Context, req *MessageRequest) (<-ch
 	return eventChan, errChan, nil
 }
 
+// CountTokens counts the number of tokens in a message
+func (s *MessagesService) CountTokens(ctx context.Context, req *MessageRequest) (int, error) {
+	for i, msg := range req.Messages {
+		if content, ok := msg.Content.(string); ok {
+			req.Messages[i].Content = []ContentBlock{
+				{
+					Type: ContentBlockTypeText,
+					Text: content,
+				},
+			}
+		} else if content, ok := msg.Content.([]ContentBlock); ok {
+			req.Messages[i].Content = content
+		} else {
+			return 0, errors.NewValidationError("content", "must be either string or []ContentBlock")
+		}
+	}
+
+	if err := validateMessageRequest(req); err != nil {
+		return 0, err
+	}
+
+	httpReq, err := s.client.newRequest(ctx, http.MethodPost, "/messages/count_tokens", req)
+	if err != nil {
+		return 0, fmt.Errorf("error creating request: %w", err)
+	}
+
+	var count int
+	if err := s.client.do(httpReq, &count); err != nil {
+		return 0, fmt.Errorf("error sending request: %w", err)
+	}
+
+	return count, nil
+}
+
 // validateMessageRequest validates a message request
 func validateMessageRequest(req *MessageRequest) error {
 	if req == nil {
